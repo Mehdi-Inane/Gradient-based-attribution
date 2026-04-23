@@ -1,3 +1,4 @@
+import os
 import torch
 import torchvision
 import torchvision.transforms as transforms
@@ -18,40 +19,71 @@ class IndexedDataset(Dataset):
         data, target = self.dataset[index]
         return index, data, target
 
-def get_cifar100_dataloaders(data_dir, batch_size=512, num_workers=4):
+def get_dataloaders(dataset_name, data_dir, batch_size, num_workers=8):
     """
-    Creates and returns the train and test dataloaders for CIFAR-100.
-    Expects data_dir to contain the extracted 'cifar-100-python' folder.
+    Creates and returns the train and test dataloaders.
+    Expects data_dir to contain the extracted datasets (e.g., $SLURM_TMPDIR).
     """
-    mean = (0.5071, 0.4865, 0.4409)
-    std = (0.2673, 0.2564, 0.2761)
+    if dataset_name == 'cifar100':
+        mean = (0.5071, 0.4865, 0.4409)
+        std = (0.2673, 0.2564, 0.2761)
 
-    train_transform = transforms.Compose([
-        transforms.RandomCrop(32, padding=4),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize(mean, std),
-    ])
+        train_transform = transforms.Compose([
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+        ])
 
-    test_transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean, std),
-    ])
+        test_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+        ])
 
-    # Load datasets locally, explicitly blocking downloads
-    raw_train_dataset = torchvision.datasets.CIFAR100(
-        root=data_dir, train=True, download=False, transform=train_transform
-    )
-    
-    raw_test_dataset = torchvision.datasets.CIFAR100(
-        root=data_dir, train=False, download=False, transform=test_transform
-    )
+        raw_train_dataset = torchvision.datasets.CIFAR100(
+            root=data_dir, train=True, download=False, transform=train_transform
+        )
+        
+        raw_test_dataset = torchvision.datasets.CIFAR100(
+            root=data_dir, train=False, download=False, transform=test_transform
+        )
 
-    # Wrap datasets to return indices
+    elif dataset_name == 'imagenet':
+        mean = [0.485, 0.456, 0.406]
+        std = [0.229, 0.224, 0.225]
+
+        train_transform = transforms.Compose([
+            transforms.Pad(32),
+            transforms.RandomCrop(224),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+        ])
+
+        test_transform = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+        ])
+
+        train_dir = os.path.join(data_dir, 'imagenet', 'train')
+        val_dir = os.path.join(data_dir, 'imagenet', 'val')
+
+        raw_train_dataset = torchvision.datasets.ImageFolder(
+            root=train_dir, transform=train_transform
+        )
+        
+        raw_test_dataset = torchvision.datasets.ImageFolder(
+            root=val_dir, transform=test_transform
+        )
+        
+    else:
+        raise ValueError(f"Dataset {dataset_name} is not supported.")
+
     train_dataset = IndexedDataset(raw_train_dataset)
     test_dataset = IndexedDataset(raw_test_dataset)
 
-    # Create DataLoaders
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True, 
         num_workers=num_workers, pin_memory=True

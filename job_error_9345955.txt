@@ -1,0 +1,21 @@
+tar: /network/datasets/imagenet/imagenet.tar: Cannot open: No such file or directory
+tar: Error is not recoverable: exiting now
+[=== Module miniconda/3 loaded ===]
+Traceback (most recent call last):
+  File "/home/mila/a/ahmedm/Gradient-based-attribution/train.py", line 176, in <module>
+    train_with_exact_gradient_deviation()
+  File "/home/mila/a/ahmedm/Gradient-based-attribution/train.py", line 95, in train_with_exact_gradient_deviation
+    train_loader, test_loader, train_dataset = get_dataloaders(
+  File "/home/mila/a/ahmedm/Gradient-based-attribution/data.py", line 73, in get_dataloaders
+    raw_train_dataset = torchvision.datasets.ImageFolder(
+  File "/home/mila/a/ahmedm/.conda/envs/unlearning/lib/python3.9/site-packages/torchvision/datasets/folder.py", line 328, in __init__
+    super().__init__(
+  File "/home/mila/a/ahmedm/.conda/envs/unlearning/lib/python3.9/site-packages/torchvision/datasets/folder.py", line 149, in __init__
+    classes, class_to_idx = self.find_classes(self.root)
+  File "/home/mila/a/ahmedm/.conda/envs/unlearning/lib/python3.9/site-packages/torchvision/datasets/folder.py", line 234, in find_classes
+    return find_classes(directory)
+  File "/home/mila/a/ahmedm/.conda/envs/unlearning/lib/python3.9/site-packages/torchvision/datasets/folder.py", line 41, in find_classes
+    classes = sorted(entry.name for entry in os.scandir(directory) if entry.is_dir())
+FileNotFoundError: [Errno 2] No such file or directory: '/tmp/imagenet/train'
+srun: error: cn-g007: task 0: Exited with exit code 1
+srun: Terminating StepId=9345955.0

@@ -2,13 +2,14 @@ import os
 import time
 import csv
 import random
+import argparse
 import torch
 import torch.nn.functional as F
 import numpy as np
 from torch.func import functional_call, vmap, grad
 
-from data import get_cifar100_dataloaders
-from resnet import get_modified_resnet50
+from data import get_dataloaders
+from resnet import get_resnet50
 from optim import get_optimizer_and_scheduler
 
 def set_seed(seed=42):
@@ -29,7 +30,6 @@ def get_batch_deviations(model, batch_grads, inputs, targets, chunk_size=16):
         return F.cross_entropy(out, y.unsqueeze(0))
 
     def compute_sq_dev(params, buffers, batch_grads, x, y):
-        
         sample_grads = grad(compute_loss, argnums=0)(params, buffers, x, y)
         sq_dev = sum(torch.sum((g - bg) ** 2) for g, bg in zip(sample_grads.values(), batch_grads))
         return sq_dev
@@ -41,7 +41,6 @@ def get_batch_deviations(model, batch_grads, inputs, targets, chunk_size=16):
         x_chunk = inputs[i:i+chunk_size]
         y_chunk = targets[i:i+chunk_size]
         
-        # Compute the deviations for this chunk
         devs = vmap_fn(params, buffers, batch_grads, x_chunk, y_chunk)
         dev_list.append(devs.detach())
         
@@ -71,30 +70,42 @@ def evaluate(model, dataloader, device):
     return total_loss / total, 100. * correct / total
 
 def train_with_exact_gradient_deviation():
+    parser = argparse.ArgumentParser(description='Exact Gradient Deviation Tracking')
+    parser.add_argument('--dataset', type=str, default='cifar100', choices=['cifar100', 'imagenet'])
+    args = parser.parse_args()
+
     set_seed(42)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+    print(f"Using device: {device} | Dataset: {args.dataset.upper()}")
     
     data_dir = os.environ.get('SLURM_TMPDIR', './data')
     print(f"Loading data from: {data_dir}")
     
-    batch_size = 512
-    epochs = 160
+    if args.dataset == 'imagenet':
+        batch_size = 896
+        epochs = 100
+        base_lr = 0.7
+        num_classes = 1000
+    else:
+        batch_size = 512
+        epochs = 160
+        base_lr = 0.4
+        num_classes = 100
     
-    train_loader, test_loader, train_dataset = get_cifar100_dataloaders(
-        data_dir=data_dir, batch_size=batch_size, num_workers=4
+    train_loader, test_loader, train_dataset = get_dataloaders(
+        dataset_name=args.dataset, data_dir=data_dir, batch_size=batch_size, num_workers=4
     )
     
-    model = get_modified_resnet50(num_classes=100).to(device)
+    model = get_resnet50(dataset_name=args.dataset, num_classes=num_classes).to(device)
     optimizer, scheduler = get_optimizer_and_scheduler(
-        model, epochs=epochs, steps_per_epoch=len(train_loader), base_lr=0.4
+        model, dataset_name=args.dataset, epochs=epochs, steps_per_epoch=len(train_loader), base_lr=base_lr
     )
     
     G_scores = np.zeros(len(train_dataset), dtype=np.float32)
     criterion = torch.nn.CrossEntropyLoss(reduction='mean')
     best_test_acc = 0.0
 
-    log_file = 'training_log.csv'
+    log_file = f'training_log_{args.dataset}.csv'
     with open(log_file, mode='w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(['Epoch', 'LR', 'Train Loss', 'Train Acc', 'Test Loss', 'Test Acc', 'Time(s)'])
@@ -123,7 +134,7 @@ def train_with_exact_gradient_deviation():
             
             batch_grads = tuple(p.grad.detach().clone() for p in model.parameters())
             
-            deviations = get_batch_deviations(model, batch_grads, inputs, targets, chunk_size=64)
+            deviations = get_batch_deviations(model, batch_grads, inputs, targets, chunk_size=16)
             G_scores[indices.cpu().numpy()] += deviations.cpu().numpy()
             
             optimizer.step()
@@ -152,13 +163,13 @@ def train_with_exact_gradient_deviation():
             'G_scores': G_scores,
             'best_test_acc': best_test_acc
         }
-        torch.save(checkpoint, 'checkpoint.pth')
+        torch.save(checkpoint, f'checkpoint_{args.dataset}.pth')
         
         if test_acc > best_test_acc:
             best_test_acc = test_acc
-            torch.save(checkpoint, 'checkpoint_best.pth')
+            torch.save(checkpoint, f'checkpoint_best_{args.dataset}.pth')
         
-    np.save('batch_gradient_deviation_scores.npy', G_scores)
+    np.save(f'batch_gradient_deviation_scores_{args.dataset}.npy', G_scores)
     print("Training complete! .")
 
 if __name__ == '__main__':

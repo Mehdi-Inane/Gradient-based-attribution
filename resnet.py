@@ -47,16 +47,24 @@ class PreActBottleneck(nn.Module):
         return net + shortcut
 
 
-class CifarResNet50(nn.Module):
+class ResNet50(nn.Module):
     """
-    Translates `CifarResNet50` (which inherits from `ResNetV2`) in the Sonnet code.
-    Designed for small inputs (small_input=True).
+    Translates `ResNetV2` in the Sonnet code.
+    Toggles `small_input` modifications automatically based on the dataset.
     """
-    def __init__(self, num_classes=100):
-        super(CifarResNet50, self).__init__()
+    def __init__(self, dataset_name='cifar100', num_classes=100):
+        super(ResNet50, self).__init__()
         
-        # initial_conv for small_input=True (3x3, stride 1)
-        self.initial_conv = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        if dataset_name == 'cifar100':
+            # small_input=True: 3x3 conv, stride 1, no maxpool
+            self.initial_conv = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+            self.maxpool = nn.Identity()
+        elif dataset_name == 'imagenet':
+            # small_input=False: 7x7 conv, stride 2, with 3x3 maxpool
+            self.initial_conv = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
+            self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        else:
+            raise ValueError(f"Dataset {dataset_name} is not supported.")
 
         # ResNet50 block config
         blocks_per_group = [3, 4, 6, 3]
@@ -93,8 +101,8 @@ class CifarResNet50(nn.Module):
 
     def forward(self, x):
         net = self.initial_conv(x)
+        net = self.maxpool(net)
         
-        # Note: small_input=True skips the max_pool2d in Sonnet code
         net = self.groups(net)
         
         net = self.final_batchnorm(net)
@@ -105,6 +113,7 @@ class CifarResNet50(nn.Module):
         
         return self.logits(net)
 
-def get_modified_resnet50(num_classes=100):
-    """Wrapper to maintain API consistency with our previous step."""
-    return CifarResNet50(num_classes=num_classes)
+
+def get_resnet50(dataset_name='cifar100', num_classes=100):
+    """Factory function to fetch the configured ResNet50."""
+    return ResNet50(dataset_name=dataset_name, num_classes=num_classes)
