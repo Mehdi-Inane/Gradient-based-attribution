@@ -3,8 +3,8 @@
 #SBATCH --output=job_output_%j.txt
 #SBATCH --error=job_error_%j.txt
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8      # Matches the num_workers in our dataloaders
-#SBATCH --gres=gpu:a100l:1           # CRITICAL: Requests 1 GPU
+#SBATCH --cpus-per-task=8      
+#SBATCH --gres=gpu:a100l:1        
 #SBATCH --time=24:00:00        
 #SBATCH --mem=80Gb           
 
@@ -19,9 +19,8 @@ if [ "$DATASET" == "cifar100" ]; then
 
 elif [ "$DATASET" == "imagenet" ]; then
     echo "Extracting ImageNet to SLURM_TMPDIR..."
-    mkdir -p $SLURM_TMPDIR/imagenet
 
-    tar -xf /network/datasets/imagenet/imagenet.tar -C $SLURM_TMPDIR/imagenet
+    tar -xf /network/datasets/imagenet/imagenet.tar -C $SLURM_TMPDIR
 else
     echo "Error: Unknown dataset $DATASET"
     exit 1

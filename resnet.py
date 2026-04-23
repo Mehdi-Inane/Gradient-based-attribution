@@ -48,10 +48,6 @@ class PreActBottleneck(nn.Module):
 
 
 class ResNet50(nn.Module):
-    """
-    Translates `ResNetV2` in the Sonnet code.
-    Toggles `small_input` modifications automatically based on the dataset.
-    """
     def __init__(self, dataset_name='cifar100', num_classes=100):
         super(ResNet50, self).__init__()
         

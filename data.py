@@ -5,10 +5,6 @@ import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, Dataset
 
 class IndexedDataset(Dataset):
-    """
-    Wraps a PyTorch Dataset to yield (index, data, target).
-    This allows us to track the original dataset index even when the DataLoader shuffles the data.
-    """
     def __init__(self, dataset):
         self.dataset = dataset
 
@@ -20,10 +16,6 @@ class IndexedDataset(Dataset):
         return index, data, target
 
 def get_dataloaders(dataset_name, data_dir, batch_size, num_workers=8):
-    """
-    Creates and returns the train and test dataloaders.
-    Expects data_dir to contain the extracted datasets (e.g., $SLURM_TMPDIR).
-    """
     if dataset_name == 'cifar100':
         mean = (0.5071, 0.4865, 0.4409)
         std = (0.2673, 0.2564, 0.2761)
