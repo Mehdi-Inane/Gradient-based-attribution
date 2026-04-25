@@ -3,6 +3,7 @@ import torch
 import torchvision
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, Dataset
+import numpy as np
 
 class IndexedDataset(Dataset):
     def __init__(self, dataset):
@@ -15,7 +16,24 @@ class IndexedDataset(Dataset):
         data, target = self.dataset[index]
         return index, data, target
 
-def get_dataloaders(dataset_name, data_dir, batch_size, num_workers=8):
+class FilteredDataset(Dataset):
+    """
+    Wraps a PyTorch Dataset to only include specific indices based on score filtering.
+    Maintains and yields the original dataset index (original_index, data, target).
+    """
+    def __init__(self, dataset, indices_to_keep):
+        self.dataset = dataset
+        self.indices_to_keep = indices_to_keep
+
+    def __len__(self):
+        return len(self.indices_to_keep)
+
+    def __getitem__(self, index):
+        original_idx = self.indices_to_keep[index]
+        data, target = self.dataset[original_idx]
+        return original_idx, data, target
+
+def get_dataloaders(dataset_name, data_dir, batch_size, num_workers=8, scores_path=None, k=0):
     if dataset_name == 'cifar100':
         mean = (0.5071, 0.4865, 0.4409)
         std = (0.2673, 0.2564, 0.2761)
@@ -73,7 +91,16 @@ def get_dataloaders(dataset_name, data_dir, batch_size, num_workers=8):
     else:
         raise ValueError(f"Dataset {dataset_name} is not supported.")
 
-    train_dataset = IndexedDataset(raw_train_dataset)
+    if scores_path is not None and k > 0:
+        scores = np.load(scores_path)
+        n = len(raw_train_dataset)
+        k_to_keep = min(k, n) # Ensure we don't try to keep more points than exist
+        top_indices = np.argsort(scores)[::-1][:k_to_keep]    
+        train_dataset = FilteredDataset(raw_train_dataset, top_indices)
+        print(f"Filtered dataset: kept top {k_to_keep} points out of {n}.")
+    else:
+        train_dataset = IndexedDataset(raw_train_dataset)
+
     test_dataset = IndexedDataset(raw_test_dataset)
 
     train_loader = DataLoader(

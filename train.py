@@ -69,15 +69,22 @@ def evaluate(model, dataloader, device):
             
     return total_loss / total, 100. * correct / total
 
-def train_with_exact_gradient_deviation():
-    parser = argparse.ArgumentParser(description='Exact Gradient Deviation Tracking')
-    parser.add_argument('--dataset', type=str, default='cifar100', choices=['cifar100', 'imagenet'])
-    args = parser.parse_args()
+def get_run_name(args, mode):
+    if args.scores_path:
+        base = os.path.splitext(os.path.basename(args.scores_path))[0]
+        return f"{args.dataset}_{base}_topk{args.k}_{mode}"
+    return f"{args.dataset}_baseline_topk{args.k}_{mode}"
 
+def train_normal(args):
+    """Executes standard training without gradient tracking."""
     set_seed(42)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device} | Dataset: {args.dataset.upper()}")
+    print(f"Using device: {device} | Dataset: {args.dataset.upper()} | Mode: Normal")
     
+    os.makedirs('checkpoints', exist_ok=True)
+    run_name = get_run_name(args, "normal")
+    print(f"Saving outputs to checkpoints/ with prefix: {run_name}")
+
     data_dir = os.environ.get('SLURM_TMPDIR', './data')
     print(f"Loading data from: {data_dir}")
     
@@ -93,7 +100,8 @@ def train_with_exact_gradient_deviation():
         num_classes = 100
     
     train_loader, test_loader, train_dataset = get_dataloaders(
-        dataset_name=args.dataset, data_dir=data_dir, batch_size=batch_size, num_workers=4
+        dataset_name=args.dataset, data_dir=data_dir, batch_size=batch_size, 
+        num_workers=4, scores_path=args.scores_path, k=args.k
     )
     
     model = get_resnet50(dataset_name=args.dataset, num_classes=num_classes).to(device)
@@ -101,11 +109,114 @@ def train_with_exact_gradient_deviation():
         model, dataset_name=args.dataset, epochs=epochs, steps_per_epoch=len(train_loader), base_lr=base_lr
     )
     
-    G_scores = np.zeros(len(train_dataset), dtype=np.float32)
     criterion = torch.nn.CrossEntropyLoss(reduction='mean')
     best_test_acc = 0.0
 
-    log_file = f'training_log_{args.dataset}.csv'
+    log_file = os.path.join('checkpoints', f'training_log_{run_name}.csv')
+    with open(log_file, mode='w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Epoch', 'LR', 'Train Loss', 'Train Acc', 'Test Loss', 'Test Acc', 'Time(s)'])
+
+    print("Training begins")
+    for epoch in range(epochs):
+        model.train()
+        start_time = time.time()
+        
+        train_loss_sum = 0.0
+        train_correct = 0
+        train_total = 0
+        
+        for batch_idx, (indices, inputs, targets) in enumerate(train_loader):
+            inputs, targets = inputs.to(device), targets.to(device)
+            
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            
+            train_loss_sum += loss.item() * targets.size(0)
+            _, predicted = outputs.max(1)
+            train_total += targets.size(0)
+            train_correct += predicted.eq(targets).sum().item()
+            
+            optimizer.step()
+            scheduler.step()
+            
+        epoch_time = time.time() - start_time
+        current_lr = scheduler.get_last_lr()[0]
+        
+        train_loss = train_loss_sum / train_total
+        train_acc = 100. * train_correct / train_total
+        
+        test_loss, test_acc = evaluate(model, test_loader, device)
+        
+        print(f"Epoch [{epoch+1}/{epochs}] | LR: {current_lr:.4f} | "
+              f"Train Acc: {train_acc:.2f}% | Test Acc: {test_acc:.2f}% | Time: {epoch_time:.1f}s")
+              
+        with open(log_file, mode='a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([epoch+1, current_lr, train_loss, train_acc, test_loss, test_acc, epoch_time])
+            
+        checkpoint = {
+            'epoch': epoch + 1,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'best_test_acc': best_test_acc
+        }
+        torch.save(checkpoint, os.path.join('/network/scratch/a/ahmedm/attribution_training_runs', f'checkpoint_{run_name}.pth'))
+        
+        if test_acc > best_test_acc:
+            best_test_acc = test_acc
+            torch.save(checkpoint, os.path.join('/network/scratch/a/ahmedm/attribution_training_runs', f'checkpoint_best_{run_name}.pth'))
+            
+    print("Training complete!")
+
+def train_with_exact_gradient_deviation(args):
+    """Executes training with full gradient deviation tracking."""
+    set_seed(42)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device} | Dataset: {args.dataset.upper()} | Mode: Tracking Gradients")
+    
+    os.makedirs('checkpoints', exist_ok=True)
+    run_name = get_run_name(args, "grad")
+    print(f"Saving outputs to checkpoints/ with prefix: {run_name}")
+
+    data_dir = os.environ.get('SLURM_TMPDIR', './data')
+    print(f"Loading data from: {data_dir}")
+    
+    if args.dataset == 'imagenet':
+        batch_size = 896
+        epochs = 100
+        base_lr = 0.7
+        num_classes = 1000
+    else:
+        batch_size = 512
+        epochs = 160
+        base_lr = 0.4
+        num_classes = 100
+    
+    train_loader, test_loader, train_dataset = get_dataloaders(
+        dataset_name=args.dataset, data_dir=data_dir, batch_size=batch_size, 
+        num_workers=4, scores_path=args.scores_path, k=args.k
+    )
+    
+    model = get_resnet50(dataset_name=args.dataset, num_classes=num_classes).to(device)
+    optimizer, scheduler = get_optimizer_and_scheduler(
+        model, dataset_name=args.dataset, epochs=epochs, steps_per_epoch=len(train_loader), base_lr=base_lr
+    )
+    
+    if hasattr(train_dataset, 'dataset'): 
+        raw_dataset_len = len(train_dataset.dataset) if hasattr(train_dataset, 'indices_to_keep') else len(train_dataset)
+    else:
+        raw_dataset_len = len(train_dataset)
+        
+    G_scores = np.zeros(raw_dataset_len, dtype=np.float32)
+    
+    criterion = torch.nn.CrossEntropyLoss(reduction='mean')
+    best_test_acc = 0.0
+
+    log_file = os.path.join('checkpoints', f'training_log_{run_name}.csv')
     with open(log_file, mode='w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(['Epoch', 'LR', 'Train Loss', 'Train Acc', 'Test Loss', 'Test Acc', 'Time(s)'])
@@ -163,14 +274,24 @@ def train_with_exact_gradient_deviation():
             'G_scores': G_scores,
             'best_test_acc': best_test_acc
         }
-        torch.save(checkpoint, f'checkpoint_{args.dataset}.pth')
+        torch.save(checkpoint, os.path.join('/network/scratch/a/ahmedm/attribution_training_runs', f'checkpoint_{run_name}.pth'))
         
         if test_acc > best_test_acc:
             best_test_acc = test_acc
-            torch.save(checkpoint, f'checkpoint_best_{args.dataset}.pth')
-        
-    np.save(f'batch_gradient_deviation_scores_{args.dataset}.npy', G_scores)
-    print("Training complete! .")
+            torch.save(checkpoint, os.path.join('/network/scratch/a/ahmedm/attribution_training_runs', f'checkpoint_best_{run_name}.pth'))
+            
+    np.save(os.path.join('/network/scratch/a/ahmedm/attribution_training_runs', f'batch_gradient_deviation_scores_{run_name}.npy'), G_scores)
+    print("Training complete!")
 
 if __name__ == '__main__':
-    train_with_exact_gradient_deviation()
+    parser = argparse.ArgumentParser(description='Exact Gradient Deviation Tracking')
+    parser.add_argument('--dataset', type=str, default='cifar100', choices=['cifar100', 'imagenet'])
+    parser.add_argument('--normal_train', action='store_true', help='Set to False/exclude to track gradients. Set to True to just do normal training.')
+    parser.add_argument('--scores_path', type=str, default=None, help='Path to the .npy file containing scores to filter the dataset.')
+    parser.add_argument('--k', type=int, default=0, help='Number of lowest scoring points to exclude from training.')
+    args = parser.parse_args()
+
+    if args.normal_train:
+        train_normal(args)
+    else:
+        train_with_exact_gradient_deviation(args)
