@@ -72,11 +72,11 @@ def main():
     
     for k in k_values:
         if args.score_type == 'grad_dev':
-            filename = f'checkpoint_cifar100_batch_gradient_deviation_scores_full_data_k{k}_normal.pth'
+            filename = f'checkpoint_cifar100_average_gradient_scores_15runs_topk{k}_normal_seed42.pth'
         elif args.score_type == 'influence':
-            filename = f'checkpoint_cifar100_feldman_avg_influence_k{k}_normal.pth'
+            filename = f'checkpoint_cifar100_feldman_avg_influence_topk{k}_normal_seed42.pth'
         elif args.score_type == 'memorization':
-            filename = f'checkpoint_cifar100_feldman_memorization_scores_k{k}_normal.pth'
+            filename = f'checkpoint_cifar100_feldman_memorization_scores_topk{k}_normal_seed42.pth'
             
         checkpoints[f"{args.score_type}_k{k}"] = os.path.join(ckpt_dir, filename)
 

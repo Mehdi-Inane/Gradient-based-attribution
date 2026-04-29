@@ -94,10 +94,16 @@ def get_dataloaders(dataset_name, data_dir, batch_size, num_workers=8, scores_pa
     if scores_path is not None and k > 0:
         scores = np.load(scores_path)
         n = len(raw_train_dataset)
-        k_to_keep = min(k, n) # Ensure we don't try to keep more points than exist
-        top_indices = np.argsort(scores)[::-1][:k_to_keep]    
-        train_dataset = FilteredDataset(raw_train_dataset, top_indices)
-        print(f"Filtered dataset: kept top {k_to_keep} points out of {n}.")
+        k_to_drop = min(k, n) # Ensure we don't try to drop more points than exist
+        
+        # Sort indices by score (ascending), then reverse to get descending (highest first)
+        descending_indices = np.argsort(scores)[::-1]
+        
+        # Keep everything AFTER the top k_to_drop indices
+        indices_to_keep = descending_indices[k_to_drop:]
+        
+        train_dataset = FilteredDataset(raw_train_dataset, indices_to_keep)
+        print(f"Filtered dataset: dropped top {k_to_drop} highest scoring points. Kept {len(indices_to_keep)} points out of {n}.")
     else:
         train_dataset = IndexedDataset(raw_train_dataset)
 
