@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=tracein_seeds
+#SBATCH --job-name=grad_dev_seeds
 #SBATCH --output=logs/job_output_%A_%a.txt   # %A=job_id, %a=array_index
 #SBATCH --error=logs/job_error_%A_%a.txt
 #SBATCH --array=0-14                          # 15 seeds: 0 through 14
@@ -40,11 +40,12 @@ module load miniconda/3
 conda activate unlearning
 
 # ── Training ─────────────────────────────────────────────────────────────────
-echo "Starting TracIn (self-influence) tracking | dataset=$DATASET | seed=$SEED"
+echo "Starting Exact Gradient Deviation tracking with historical epoch dumping | dataset=$DATASET | seed=$SEED"
 
+# Omitting --normal_train and --tracein_train tells the script to compute exact gradient deviations.
 srun python train.py \
     --dataset $DATASET \
     --seed $SEED \
-    --tracein_train
+    --save_epoch_scores
 
 echo "Job $SLURM_ARRAY_TASK_ID finished."

@@ -5,14 +5,12 @@ BASE_PATH="/home/mila/a/ahmedm/Gradient-based-attribution"
 
 # Associate methods with their corresponding score arrays
 METHODS=(
-    "our_method|${BASE_PATH}/average_gradient_scores_15runs.npy"
-    "feldman_memorization|${BASE_PATH}/feldman_memorization_scores.npy"
-    "feldman_average_influence|${BASE_PATH}/feldman_avg_influence.npy"
+    "random_baseline|random"
 )
 # IMPORTANT: add traceIn scores once done
 K_VALUES=(5000 10000 20000 30000)
 
-echo "Submitting 16 evaluation jobs..."
+echo "Submitting evaluation jobs..."
 
 for item in "${METHODS[@]}"; do
     METHOD_NAME="${item%%|*}"
@@ -31,4 +29,4 @@ for item in "${METHODS[@]}"; do
     done
 done
 
-echo "All 16 jobs submitted!"
+echo "All jobs submitted!"

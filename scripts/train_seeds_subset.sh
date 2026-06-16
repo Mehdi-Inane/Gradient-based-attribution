@@ -1,12 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=eval_seeds
-#SBATCH --output=logs/subset_trains/job_eval_%j.txt
-#SBATCH --error=logs/subset_trains/job_eval_%j.txt
-#SBATCH --gpus=1
+#SBATCH --output=logs/subset_trains/job_eval_output_%j.txt
+#SBATCH --error=logs/subset_trains/job_eval_error_%j.txt
+#SBATCH --gpus=a100l:1
 #SBATCH --ntasks=5               # 5 seeds
 #SBATCH --cpus-per-task=2        # 10 CPUs total for the job
 #SBATCH --time=24:00:00
-#SBATCH --mem=48Gb
+#SBATCH --mem=64Gb
 
 # 1. Extract dataset to TMPDIR (Runs exactly ONCE per job)
 echo "Extracting CIFAR-100 to SLURM_TMPDIR..."

@@ -33,7 +33,7 @@ class FilteredDataset(Dataset):
         data, target = self.dataset[original_idx]
         return original_idx, data, target
 
-def get_dataloaders(dataset_name, data_dir, batch_size, num_workers=8, scores_path=None, k=0):
+def get_dataloaders(dataset_name, data_dir, batch_size, num_workers=8, scores_path=None, k=0, seed=42):
     if dataset_name == 'cifar100':
         mean = (0.5071, 0.4865, 0.4409)
         std = (0.2673, 0.2564, 0.2761)
@@ -92,18 +92,29 @@ def get_dataloaders(dataset_name, data_dir, batch_size, num_workers=8, scores_pa
         raise ValueError(f"Dataset {dataset_name} is not supported.")
 
     if scores_path is not None and k > 0:
-        scores = np.load(scores_path)
         n = len(raw_train_dataset)
         k_to_drop = min(k, n) # Ensure we don't try to drop more points than exist
         
-        # Sort indices by score (ascending), then reverse to get descending (highest first)
-        descending_indices = np.argsort(scores)[::-1]
-        
-        # Keep everything AFTER the top k_to_drop indices
-        indices_to_keep = descending_indices[k_to_drop:]
-        
+        # --- NEW RANDOM BASELINE LOGIC ---
+        if scores_path.lower() == 'random':
+            # Create a deterministic random generator based on the current seed
+            rng = np.random.RandomState(seed)
+            all_indices = np.arange(n)
+            rng.shuffle(all_indices)
+            
+            # Keep everything AFTER the first k_to_drop randomly shuffled indices
+            indices_to_keep = all_indices[k_to_drop:]
+            print(f"Filtered dataset: dropped {k_to_drop} RANDOM points (Seed {seed}). Kept {len(indices_to_keep)} points.")
+        else:
+            # --- ORIGINAL SCORING LOGIC ---
+            scores = np.load(scores_path)
+            # Sort indices by score (ascending), then reverse to get descending (highest first)
+            descending_indices = np.argsort(scores)[::-1]
+            # Keep everything AFTER the top k_to_drop indices
+            indices_to_keep = descending_indices[k_to_drop:]
+            print(f"Filtered dataset: dropped top {k_to_drop} highest scoring points. Kept {len(indices_to_keep)} points out of {n}.")
+            
         train_dataset = FilteredDataset(raw_train_dataset, indices_to_keep)
-        print(f"Filtered dataset: dropped top {k_to_drop} highest scoring points. Kept {len(indices_to_keep)} points out of {n}.")
     else:
         train_dataset = IndexedDataset(raw_train_dataset)
 

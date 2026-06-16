@@ -5,7 +5,7 @@ import numpy as np
 from collections import defaultdict
 from torch.utils.data import DataLoader, Dataset
 import torchvision.transforms as transforms
-from datasets import load_dataset
+from datasets import load_from_disk
 from resnet import get_resnet50
 
 class HFCifar100CDataset(Dataset):
@@ -30,7 +30,7 @@ def evaluate_model(model, dataloader, device):
     stats_per_corruption = defaultdict(lambda: {'correct': 0, 'total': 0})
     
     with torch.no_grad():
-        for batch_idx, (inputs, targets, corruptions) in enumerate(dataloader):
+        for inputs, targets, corruptions in dataloader:
             inputs, targets = inputs.to(device), targets.to(device)
             outputs = model(inputs)
             _, predicted = outputs.max(1)
@@ -56,64 +56,70 @@ def evaluate_model(model, dataloader, device):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--score_type', type=str, required=True, 
-                        choices=['grad_dev', 'influence', 'memorization'])
+    parser.add_argument('--method_name', type=str, required=True)
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device} | Task: {args.score_type.upper()}")
-
     scratch_dir = os.environ.get('SCRATCH', './')
     ckpt_dir = os.path.join(scratch_dir, 'attribution_training_runs')
     
-    # Map score_type to file name templates
-    k_values = [5000, 10000, 20000, 30000]
-    checkpoints = {}
+    # Path where you saved the dataset using Step 1
+    local_data_path = os.path.join(scratch_dir, 'hf_datasets', 'cifar100-c')
     
-    for k in k_values:
-        if args.score_type == 'grad_dev':
-            filename = f'checkpoint_cifar100_average_gradient_scores_15runs_topk{k}_normal_seed42.pth'
-        elif args.score_type == 'influence':
-            filename = f'checkpoint_cifar100_feldman_avg_influence_topk{k}_normal_seed42.pth'
-        elif args.score_type == 'memorization':
-            filename = f'checkpoint_cifar100_feldman_memorization_scores_topk{k}_normal_seed42.pth'
-            
-        checkpoints[f"{args.score_type}_k{k}"] = os.path.join(ckpt_dir, filename)
+    k_values = [5000, 10000, 20000, 30000]
+    seeds = [0, 1, 2, 3, 4]
 
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.5071, 0.4865, 0.4409), (0.2673, 0.2564, 0.2761)),
     ])
     
-    # We rely on the bash script to export HF_DATASETS_CACHE=$SLURM_TMPDIR
-    print("Loading CIFAR-100-C from Hugging Face...")
-    hf_dataset = load_dataset("randall-lab/cifar100-c", split="test", trust_remote_code=True)
+    print(f"Loading CIFAR-100-C from local disk: {local_data_path}")
+    hf_dataset = load_from_disk(local_data_path)
     dataset = HFCifar100CDataset(hf_dataset, transform=transform)
     dataloader = DataLoader(dataset, batch_size=512, shuffle=False, num_workers=4)
     
+    model = get_resnet50(dataset_name='cifar100', num_classes=100).to(device)
+    
     all_results = {}
 
-    for model_name, ckpt_path in checkpoints.items():
-        print(f"\nEvaluating {model_name}...")
-        if not os.path.exists(ckpt_path):
-            print(f"  -> Checkpoint not found at {ckpt_path}! Skipping.")
-            continue
-            
-        model = get_resnet50(dataset_name='cifar100', num_classes=100).to(device)
-        checkpoint = torch.load(ckpt_path, map_location=device)
+    for k in k_values:
+        print(f"\n--- Evaluating K={k} ---")
+        # seed_accs_per_corr[corruption_name] = [acc_seed0, acc_seed1, ...]
+        seed_accs_per_corr = defaultdict(list)
         
-        if 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'])
-        else:
-            model.load_state_dict(checkpoint)
+        for seed in seeds:
+            ckpt_path = os.path.join(ckpt_dir, args.method_name, str(k), f'final_checkpoint_seed{seed}.pth')
             
-        results = evaluate_model(model, dataloader, device)
-        all_results[model_name] = results
-        print(f"  -> Overall OOD Accuracy: {results['Overall_Mean']:.2f}%")
+            if not os.path.exists(ckpt_path):
+                print(f"  -> Skipping seed {seed}: Checkpoint not found.")
+                continue
+                
+            checkpoint = torch.load(ckpt_path, map_location=device)
+            model.load_state_dict(checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint)
+                
+            results = evaluate_model(model, dataloader, device)
+            
+            for key, acc in results.items():
+                seed_accs_per_corr[key].append(acc)
+                
+        if seed_accs_per_corr:
+            # We store a dictionary containing BOTH the mean and the raw seed list
+            # to make plotting error bars very easy later.
+            k_stats = {}
+            for key, acc_list in seed_accs_per_corr.items():
+                k_stats[key] = {
+                    'mean': np.mean(acc_list),
+                    'std': np.std(acc_list),
+                    'raw': acc_list
+                }
+            
+            all_results[f"k{k}"] = k_stats
+            print(f" => Mean OOD Accuracy for K={k}: {k_stats['Overall_Mean']['mean']:.2f}%")
 
-    output_file = os.path.join(ckpt_dir, f'ood_results_{args.score_type}.npy')
+    output_file = os.path.join(ckpt_dir, f'ood_results_{args.method_name}.npy')
     np.save(output_file, all_results, allow_pickle=True)
-    print(f"\nSaved {args.score_type} results to: {output_file}")
+    print(f"\nResults saved to: {output_file}")
 
 if __name__ == '__main__':
     main()
