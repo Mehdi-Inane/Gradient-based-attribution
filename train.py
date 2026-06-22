@@ -3,6 +3,7 @@ import csv
 import os
 import random
 import time
+from typing import Callable
 
 import numpy as np
 import torch
@@ -12,6 +13,9 @@ from torch.func import functional_call, grad, vmap
 from data import get_dataloaders
 from optim import get_optimizer_and_scheduler
 from resnet import get_resnet50
+
+# Stores and re-uses compiled vmap functions.
+_compiled_cache: dict[int, Callable] = {}
 
 
 def set_seed(seed=42):
@@ -25,7 +29,9 @@ def get_batch_deviations(
         batch_grads: tuple[torch.Tensor, ...],
         inputs: torch.Tensor,
         targets: torch.Tensor,
-        chunk_size: int) -> torch.Tensor:
+        chunk_size: int,
+        mode: str | None = None,
+    ) -> torch.Tensor:
     was_training = model.training
     model.eval()
 
@@ -47,6 +53,11 @@ def get_batch_deviations(
         return (g_sq - 2.0 * g_dot_b + batch_grads_norm_sq).detach()  # type: ignore[union-attr]
 
     vmap_fn = vmap(func=compute_sq_dev, in_dims=(None, None, 0, 0))
+    if mode:
+        key = id(model)
+        if key not in _compiled_cache:
+            _compiled_cache[key] = torch.compile(vmap_fn, mode=mode, dynamic=False)
+        vmap_fn = _compiled_cache[key]
 
     # Pre-allocate to reduce in-memory accumulation. Reduces ~20% of memory.
     result = torch.empty(inputs.size(0), device=inputs.device)
@@ -396,7 +407,7 @@ def train_with_exact_gradient_deviation(args):
             train_correct += predicted.eq(targets).sum().item()
 
             batch_grads = tuple(p.grad.detach().clone() for p in model.parameters())
-            deviations = get_batch_deviations(model, batch_grads, inputs, targets, chunk_size=32)
+            deviations = get_batch_deviations(model, batch_grads, inputs, targets, 32, args.compile_mode)
             G_scores[indices.cpu().numpy()] += deviations.cpu().numpy()
 
             optimizer.step()
@@ -456,9 +467,20 @@ if __name__ == '__main__':
                         # tar -xzf /network/datasets/cifar100/cifar-100-python.tar.gz -C ./data
                         default=os.environ.get('SLURM_TMPDIR', './data'),
                         help='Datasets directory.')
+    # Compilation takes ~30 seconds, but offers the following speedup
+    #
+    # ResNet50/cifar100 batch=64 chunk_size=32 device=cuda (N=8)
+    # optimized : mean=63.4ms  peak_mem=1050.9MB  (default = 1.97x)
+    # optimized : mean=57.1ms  peak_mem=191.3MB   (reduce-overhead = 2.20x)
+    # optimized : mean=56.5ms  peak_mem=191.3MB   (max-autotune = 2.27x)
+    # original  : mean=128.5ms peak_mem=5915.9MB  (1.00x)
+    default_compile_mode = "max-autotune"
+    parser.add_argument('--compile', action='store_true',
+                        help=f'Compile vmap with torch.compile (mode="{default_compile_mode}").')
     parser.add_argument('--save_epoch_scores', action='store_true', help='Save score files sequentially over epochs.')
     args = parser.parse_args()
 
+    args.compile_mode = default_compile_mode if args.compile else None
     if 'SLURM_PROCID' in os.environ:
         array_id = int(os.environ.get('SLURM_ARRAY_TASK_ID', 0))
         num_tasks = int(os.environ.get('SLURM_NUM_TASKS', 1))
