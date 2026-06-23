@@ -17,6 +17,37 @@ from resnet import get_resnet50
 # Stores and re-uses compiled vmap functions.
 _compiled_cache: dict[int, Callable] = {}
 
+class CudaPrefetcher:
+    """Overlaps Host->Device transfer of the next batch with GPU compute on the current one."""
+    def __init__(self, loader, device):
+        self.loader = iter(loader)
+        self.device = device
+        self.stream = torch.cuda.Stream()
+        self._next = None
+        self._preload()
+
+    def _preload(self):
+        try:
+            batch = next(self.loader)
+        except StopIteration:
+            self._next = None
+            return
+        with torch.cuda.stream(self.stream):
+            self._next = tuple(t.to(self.device, non_blocking=True) for t in batch)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        torch.cuda.current_stream().wait_stream(self.stream)
+        batch = self._next
+        if batch is None:
+            raise StopIteration
+        for t in batch:
+            t.record_stream(torch.cuda.current_stream())
+        # Start transfering the next batch to the GPU so that it's ready at the next call.
+        self._preload()
+        return batch
 
 def set_seed(seed=42):
     random.seed(seed)
@@ -25,8 +56,7 @@ def set_seed(seed=42):
     torch.cuda.manual_seed_all(seed)
 
 def get_batch_deviations(
-        model,
-        batch_grads: tuple[torch.Tensor, ...],
+        model: torch.nn.Module,
         inputs: torch.Tensor,
         targets: torch.Tensor,
         chunk_size: int,
@@ -38,19 +68,24 @@ def get_batch_deviations(
     params = dict(model.named_parameters())
     buffers = dict(model.named_buffers())
 
+    params_with_grad = [p for p in model.parameters() if p.grad is not None]
+    batch_grads = torch.cat([p.grad.detach().view(-1) for p in params_with_grad if p.grad is not None])
+
     def compute_loss(params, buffers, x: torch.Tensor, y: torch.Tensor):
         out = functional_call(model, (params, buffers), x.unsqueeze(0))
         return F.cross_entropy(out, y.unsqueeze(0))
 
     # Pre-calculate to memory needed when mapping compute_sq_dev. Reduces ~35% of memory.
-    batch_grads_norm_sq = sum(bg.pow(2).sum() for bg in batch_grads)
+    batch_grads_split = torch.split(batch_grads, [p.numel() for p in params_with_grad])
+    batch_grads_norm_sq = batch_grads.pow(2).sum()
 
     def compute_sq_dev(params, buffers, x: torch.Tensor, y: torch.Tensor):
         sample_grads = grad(compute_loss, argnums=0)(params, buffers, x, y).values()
         # Re-written using the identity ||g - bg||² = ||g||² - 2(g·bg) + ||bg||²
         g_sq    = sum(g.pow(2).sum() for g in sample_grads)
-        g_dot_b = sum((g * bg).sum() for g, bg in zip(sample_grads, batch_grads))
-        return (g_sq - 2.0 * g_dot_b + batch_grads_norm_sq).detach()  # type: ignore[union-attr]
+        g_dot_b = sum((g.view(-1) * bg).sum() for g, bg in zip(sample_grads, batch_grads_split))
+        return (g_sq - 2.0 * g_dot_b + batch_grads_norm_sq).detach()
+
 
     vmap_fn = vmap(func=compute_sq_dev, in_dims=(None, None, 0, 0))
     if mode:
@@ -375,7 +410,7 @@ def train_with_exact_gradient_deviation(args):
     else:
         raw_dataset_len = len(train_dataset)
 
-    G_scores = np.zeros(raw_dataset_len, dtype=np.float32)
+    G_scores = torch.zeros(raw_dataset_len, device=device, dtype=torch.float32)
     criterion = torch.nn.CrossEntropyLoss(reduction='mean')
     best_test_acc = 0.0
 
@@ -389,34 +424,34 @@ def train_with_exact_gradient_deviation(args):
         model.train()
         start_time = time.time()
 
-        train_loss_sum = 0.0
-        train_correct = 0
+        # Pre-allocate storage for loop so that the .item() is deferred
+        train_loss_sum = torch.zeros(1, device=device)
+        train_correct = torch.zeros(1, device=device)
+
         train_total = 0
 
-        for batch_idx, (indices, inputs, targets) in enumerate(train_loader):
-            inputs, targets = inputs.to(device), targets.to(device)
-
+        for batch_idx, (indices, inputs, targets) in enumerate(CudaPrefetcher(train_loader, device)):
             optimizer.zero_grad()
             outputs = model(inputs)
             loss = criterion(outputs, targets)
             loss.backward()
 
-            train_loss_sum += loss.item() * targets.size(0)
+            train_loss_sum += loss.detach() * targets.size(0)
             _, predicted = outputs.max(1)
             train_total += targets.size(0)
-            train_correct += predicted.eq(targets).sum().item()
+            train_correct += predicted.eq(targets).sum()
 
-            batch_grads = tuple(p.grad.detach().clone() for p in model.parameters())
-            deviations = get_batch_deviations(model, batch_grads, inputs, targets, 32, args.compile_mode)
-            G_scores[indices.cpu().numpy()] += deviations.cpu().numpy()
+            # chunk_size values > 32 appear to hit a limit on the L40S. A A100 may allow chunks of 64?
+            deviations = get_batch_deviations(model, inputs, targets, 32, args.compile_mode)
+            G_scores.scatter_add_(0, indices, deviations)
 
             optimizer.step()
             scheduler.step()
 
         epoch_time = time.time() - start_time
         current_lr = scheduler.get_last_lr()[0]
-        train_loss = train_loss_sum / train_total
-        train_acc = 100. * train_correct / train_total
+        train_loss = train_loss_sum.item() / train_total
+        train_acc = 100. * train_correct.item() / train_total
 
         test_loss, test_acc = evaluate(model, test_loader, device)
         epoch_num = epoch + 1
@@ -444,10 +479,10 @@ def train_with_exact_gradient_deviation(args):
         # --- SAVE SCORES PROGRESSION TRAJECTORY ---
         if args.save_epoch_scores and (epoch_num <= 10 or epoch_num % 10 == 0):
             history_file_name = f"epoch_scores_{run_name}_epoch{epoch_num}.npy"
-            np.save(os.path.join(args.out, history_file_name), G_scores)
+            np.save(os.path.join(args.out, history_file_name), G_scores.cpu().numpy())
             print(f" Saved score snapshot to {history_file_name}")
 
-    np.save(os.path.join(args.out, f'batch_gradient_deviation_scores_{run_name}.npy'), G_scores)
+    np.save(os.path.join(args.out, f'batch_gradient_deviation_scores_{run_name}.npy'), G_scores.cpu().numpy())
     print(f"Training complete! Final G_scores saved for seed {args.seed}.")
 
 if __name__ == '__main__':
@@ -474,7 +509,7 @@ if __name__ == '__main__':
     # optimized : mean=57.1ms  peak_mem=191.3MB   (reduce-overhead = 2.20x)
     # optimized : mean=56.5ms  peak_mem=191.3MB   (max-autotune = 2.27x)
     # original  : mean=128.5ms peak_mem=5915.9MB  (1.00x)
-    default_compile_mode = "max-autotune"
+    default_compile_mode = "reduce-overhead"
     parser.add_argument('--compile', action='store_true',
                         help=f'Compile vmap with torch.compile (mode="{default_compile_mode}").')
     parser.add_argument('--save_epoch_scores', action='store_true', help='Save score files sequentially over epochs.')
