@@ -60,7 +60,7 @@ def get_batch_deviations(
         inputs: torch.Tensor,
         targets: torch.Tensor,
         chunk_size: int,
-        mode: str | None = None,
+        compile_mode: str | None = None,
     ) -> torch.Tensor:
     was_training = model.training
     model.eval()
@@ -88,11 +88,10 @@ def get_batch_deviations(
 
 
     vmap_fn = vmap(func=compute_sq_dev, in_dims=(None, None, 0, 0))
-    if mode:
-        key = id(model)
-        if key not in _compiled_cache:
-            _compiled_cache[key] = torch.compile(vmap_fn, mode=mode, dynamic=False)
-        vmap_fn = _compiled_cache[key]
+    key = id(model)
+    if key not in _compiled_cache:
+        _compiled_cache[key] = torch.compile(vmap_fn, mode=compile_mode, disable=compile_mode is None)
+    vmap_fn = _compiled_cache[key]
 
     # Pre-allocate to reduce in-memory accumulation. Reduces ~20% of memory.
     result = torch.empty(inputs.size(0), device=inputs.device)
@@ -419,6 +418,9 @@ def train_with_exact_gradient_deviation(args):
         writer = csv.writer(f)
         writer.writerow(['Epoch', 'LR', 'Train Loss', 'Train Acc', 'Test Loss', 'Test Acc', 'Time(s)'])
 
+    # chunk_size > 32 appear to hit a mem limit on devices with ~48GB
+    vmap_chunk_size = 16 if args.compile else 128
+
     print("Training begins")
     for epoch in range(epochs):
         model.train()
@@ -436,13 +438,12 @@ def train_with_exact_gradient_deviation(args):
             loss = criterion(outputs, targets)
             loss.backward()
 
-            train_loss_sum += loss.detach() * targets.size(0)
+            train_loss_sum += loss * targets.size(0)
             _, predicted = outputs.max(1)
             train_total += targets.size(0)
             train_correct += predicted.eq(targets).sum()
 
-            # chunk_size values > 32 appear to hit a limit on the L40S. A A100 may allow chunks of 64?
-            deviations = get_batch_deviations(model, inputs, targets, 32, args.compile_mode)
+            deviations = get_batch_deviations(model, inputs, targets, vmap_chunk_size, args.compile)
             G_scores.scatter_add_(0, indices, deviations)
 
             optimizer.step()
@@ -502,20 +503,13 @@ if __name__ == '__main__':
                         # tar -xzf /network/datasets/cifar100/cifar-100-python.tar.gz -C ./data
                         default=os.environ.get('SLURM_TMPDIR', './data'),
                         help='Datasets directory.')
-    # Compilation takes ~30 seconds, but offers the following speedup
-    #
-    # ResNet50/cifar100 batch=64 chunk_size=32 device=cuda (N=8)
-    # optimized : mean=63.4ms  peak_mem=1050.9MB  (default = 1.97x)
-    # optimized : mean=57.1ms  peak_mem=191.3MB   (reduce-overhead = 2.20x)
-    # optimized : mean=56.5ms  peak_mem=191.3MB   (max-autotune = 2.27x)
-    # original  : mean=128.5ms peak_mem=5915.9MB  (1.00x)
     default_compile_mode = "reduce-overhead"
-    parser.add_argument('--compile', action='store_true',
-                        help=f'Compile vmap with torch.compile (mode="{default_compile_mode}").')
+    parser.add_argument('--compile', nargs='?', const=default_compile_mode, default=None,
+                        choices=['default', 'reduce-overhead', 'max-autotune', 'max-autotune-no-cudagraphs'],
+                        help=f'Compile vmap with torch.compile. Use without a value for mode="{default_compile_mode}", or pass a mode explicitly (e.g. --compile default).')
     parser.add_argument('--save_epoch_scores', action='store_true', help='Save score files sequentially over epochs.')
     args = parser.parse_args()
 
-    args.compile_mode = default_compile_mode if args.compile else None
     if 'SLURM_PROCID' in os.environ:
         array_id = int(os.environ.get('SLURM_ARRAY_TASK_ID', 0))
         num_tasks = int(os.environ.get('SLURM_NUM_TASKS', 1))
