@@ -1,18 +1,53 @@
-import os
-import time
-import csv
-import random
 import argparse
+import csv
+import os
+import random
+import time
+from typing import Callable
+
+import numpy as np
 import torch
 import torch.nn.functional as F
-import numpy as np
-from torch.func import functional_call, vmap, grad
+from torch.func import functional_call, grad, vmap
 
 from data import get_dataloaders
-from resnet import get_resnet50
 from optim import get_optimizer_and_scheduler
+from resnet import get_resnet50
 
-SCRATCH_DIR = '/network/scratch/a/ahmedm/attribution_training_runs'
+# Stores and re-uses compiled vmap functions.
+_compiled_cache: dict[int, Callable] = {}
+
+class CudaPrefetcher:
+    """Overlaps Host->Device transfer of the next batch with GPU compute on the current one."""
+    def __init__(self, loader, device):
+        self.loader = iter(loader)
+        self.device = device
+        self.stream = torch.cuda.Stream()
+        self._next = None
+        self._preload()
+
+    def _preload(self):
+        try:
+            batch = next(self.loader)
+        except StopIteration:
+            self._next = None
+            return
+        with torch.cuda.stream(self.stream):
+            self._next = tuple(t.to(self.device, non_blocking=True) for t in batch)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        torch.cuda.current_stream().wait_stream(self.stream)
+        batch = self._next
+        if batch is None:
+            raise StopIteration
+        for t in batch:
+            t.record_stream(torch.cuda.current_stream())
+        # Start transfering the next batch to the GPU so that it's ready at the next call.
+        self._preload()
+        return batch
 
 def set_seed(seed=42):
     random.seed(seed)
@@ -20,35 +55,55 @@ def set_seed(seed=42):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-def get_batch_deviations(model, batch_grads, inputs, targets, chunk_size=16):
+def get_batch_deviations(
+        model: torch.nn.Module,
+        inputs: torch.Tensor,
+        targets: torch.Tensor,
+        chunk_size: int,
+        compile_mode: str | None = None,
+    ) -> torch.Tensor:
     was_training = model.training
     model.eval()
 
     params = dict(model.named_parameters())
     buffers = dict(model.named_buffers())
 
-    def compute_loss(params, buffers, x, y):
+    params_with_grad = [p for p in model.parameters() if p.grad is not None]
+    batch_grads = torch.cat([p.grad.detach().view(-1) for p in params_with_grad if p.grad is not None])
+
+    def compute_loss(params, buffers, x: torch.Tensor, y: torch.Tensor):
         out = functional_call(model, (params, buffers), x.unsqueeze(0))
         return F.cross_entropy(out, y.unsqueeze(0))
 
-    def compute_sq_dev(params, buffers, batch_grads, x, y):
-        sample_grads = grad(compute_loss, argnums=0)(params, buffers, x, y)
-        sq_dev = sum(torch.sum((g - bg) ** 2) for g, bg in zip(sample_grads.values(), batch_grads))
-        return sq_dev
+    # Pre-calculate to memory needed when mapping compute_sq_dev. Reduces ~35% of memory.
+    batch_grads_split = torch.split(batch_grads, [p.numel() for p in params_with_grad])
+    batch_grads_norm_sq = batch_grads.pow(2).sum()
 
-    vmap_fn = vmap(compute_sq_dev, in_dims=(None, None, None, 0, 0))
-    dev_list = []
+    def compute_sq_dev(params, buffers, x: torch.Tensor, y: torch.Tensor):
+        sample_grads = grad(compute_loss, argnums=0)(params, buffers, x, y).values()
+        # Re-written using the identity ||g - bg||² = ||g||² - 2(g·bg) + ||bg||²
+        g_sq    = sum(g.pow(2).sum() for g in sample_grads)
+        g_dot_b = sum((g.view(-1) * bg).sum() for g, bg in zip(sample_grads, batch_grads_split))
+        return (g_sq - 2.0 * g_dot_b + batch_grads_norm_sq).detach()
+
+
+    vmap_fn = vmap(func=compute_sq_dev, in_dims=(None, None, 0, 0))
+    key = id(model)
+    if key not in _compiled_cache:
+        _compiled_cache[key] = torch.compile(vmap_fn, mode=compile_mode, disable=compile_mode is None)
+    vmap_fn = _compiled_cache[key]
+
+    # Pre-allocate to reduce in-memory accumulation. Reduces ~20% of memory.
+    result = torch.empty(inputs.size(0), device=inputs.device)
 
     for i in range(0, inputs.size(0), chunk_size):
-        x_chunk = inputs[i:i+chunk_size]
-        y_chunk = targets[i:i+chunk_size]
-        devs = vmap_fn(params, buffers, batch_grads, x_chunk, y_chunk)
-        dev_list.append(devs.detach())
+        result[i:i+chunk_size] = vmap_fn(params, buffers, inputs[i:i+chunk_size], targets[i:i+chunk_size])
 
     if was_training:
         model.train()
 
-    return torch.cat(dev_list)
+    return result
+
 
 def get_batch_grad_norms(model, inputs, targets, chunk_size=16):
     was_training = model.training
@@ -114,9 +169,8 @@ def train_normal(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Task {os.environ.get('SLURM_PROCID', 0)} | Seed: {args.seed} | Method: {args.method_name} | K: {args.k} | Mode: Normal")
 
-    save_dir = os.path.join(SCRATCH_DIR, args.method_name, str(args.k))
+    save_dir = os.path.join(args.out, args.method_name, str(args.k))
     os.makedirs(save_dir, exist_ok=True)
-    data_dir = os.environ.get('SLURM_TMPDIR', './data')
 
     if args.dataset == 'imagenet':
         batch_size = 896
@@ -130,7 +184,7 @@ def train_normal(args):
         num_classes = 100
 
     train_loader, test_loader, _ = get_dataloaders(
-        dataset_name=args.dataset, data_dir=data_dir, batch_size=batch_size,
+        dataset_name=args.dataset, data_dir=args.data, batch_size=batch_size,
         num_workers=2, scores_path=args.scores_path, k=args.k, seed=args.seed
     )
 
@@ -208,13 +262,12 @@ def train_with_tracein(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device} | Dataset: {args.dataset.upper()} | Mode: Tracking TracIn | Seed: {args.seed}")
 
-    tracein_dir = os.path.join(SCRATCH_DIR, 'tracein_xps')
+    tracein_dir = os.path.join(args.out, 'tracein_xps')
     os.makedirs('checkpoints', exist_ok=True)
-    os.makedirs(SCRATCH_DIR, exist_ok=True)
+    os.makedirs(args.out, exist_ok=True)
     os.makedirs(tracein_dir, exist_ok=True)
-    
+
     run_name = get_run_name(args, "tracein")
-    data_dir = os.environ.get('SLURM_TMPDIR', './data')
 
     if args.dataset == 'imagenet':
         batch_size = 896
@@ -228,7 +281,7 @@ def train_with_tracein(args):
         num_classes = 100
 
     train_loader, test_loader, _ = get_dataloaders(
-        dataset_name=args.dataset, data_dir=data_dir, batch_size=batch_size,
+        dataset_name=args.dataset, data_dir=args.data, batch_size=batch_size,
         num_workers=2, scores_path=args.scores_path, k=args.k, seed=args.seed
     )
 
@@ -304,18 +357,18 @@ def train_with_tracein(args):
             'TraceIn_scores': TraceIn_scores,
             'best_test_acc': best_test_acc
         }
-        
-        torch.save(checkpoint, os.path.join(SCRATCH_DIR, f'checkpoint_{run_name}.pth'))
+
+        torch.save(checkpoint, os.path.join(args.out, f'checkpoint_{run_name}.pth'))
 
         if test_acc > best_test_acc:
             best_test_acc = test_acc
-            torch.save(checkpoint, os.path.join(SCRATCH_DIR, f'checkpoint_best_{run_name}.pth'))
-            
+            torch.save(checkpoint, os.path.join(args.out, f'checkpoint_best_{run_name}.pth'))
+
         if (epoch + 1) % 20 == 0:
             ckpt_name = f'checkpoint_{run_name}_epoch{epoch+1}.pth'
             torch.save(checkpoint, os.path.join(tracein_dir, ckpt_name))
 
-    np.save(os.path.join(SCRATCH_DIR, f'tracein_scores_{run_name}.npy'), TraceIn_scores)
+    np.save(os.path.join(args.out, f'tracein_scores_{run_name}.npy'), TraceIn_scores)
     print(f"Training complete! TraceIn_scores saved for seed {args.seed}.")
 
 
@@ -325,9 +378,8 @@ def train_with_exact_gradient_deviation(args):
     print(f"Using device: {device} | Dataset: {args.dataset.upper()} | Mode: Tracking Gradients | Seed: {args.seed}")
 
     os.makedirs('checkpoints', exist_ok=True)
-    os.makedirs(SCRATCH_DIR, exist_ok=True)
+    os.makedirs(args.out, exist_ok=True)
     run_name = get_run_name(args, "grad")
-    data_dir = os.environ.get('SLURM_TMPDIR', './data')
 
     if args.dataset == 'imagenet':
         batch_size = 896
@@ -341,7 +393,7 @@ def train_with_exact_gradient_deviation(args):
         num_classes = 100
 
     train_loader, test_loader, _ = get_dataloaders(
-        dataset_name=args.dataset, data_dir=data_dir, batch_size=batch_size,
+        dataset_name=args.dataset, data_dir=args.data, batch_size=batch_size,
         num_workers=2, scores_path=args.scores_path, k=args.k, seed=args.seed
     )
 
@@ -357,7 +409,7 @@ def train_with_exact_gradient_deviation(args):
     else:
         raw_dataset_len = len(train_dataset)
 
-    G_scores = np.zeros(raw_dataset_len, dtype=np.float32)
+    G_scores = torch.zeros(raw_dataset_len, device=device, dtype=torch.float32)
     criterion = torch.nn.CrossEntropyLoss(reduction='mean')
     best_test_acc = 0.0
 
@@ -366,39 +418,41 @@ def train_with_exact_gradient_deviation(args):
         writer = csv.writer(f)
         writer.writerow(['Epoch', 'LR', 'Train Loss', 'Train Acc', 'Test Loss', 'Test Acc', 'Time(s)'])
 
+    # chunk_size > 32 appear to hit a mem limit on devices with ~48GB
+    vmap_chunk_size = 16 if args.compile else 128
+
     print("Training begins")
     for epoch in range(epochs):
         model.train()
         start_time = time.time()
 
-        train_loss_sum = 0.0
-        train_correct = 0
+        # Pre-allocate storage for loop so that the .item() is deferred
+        train_loss_sum = torch.zeros(1, device=device)
+        train_correct = torch.zeros(1, device=device)
+
         train_total = 0
 
-        for batch_idx, (indices, inputs, targets) in enumerate(train_loader):
-            inputs, targets = inputs.to(device), targets.to(device)
-
+        for batch_idx, (indices, inputs, targets) in enumerate(CudaPrefetcher(train_loader, device)):
             optimizer.zero_grad()
             outputs = model(inputs)
             loss = criterion(outputs, targets)
             loss.backward()
 
-            train_loss_sum += loss.item() * targets.size(0)
+            train_loss_sum += loss * targets.size(0)
             _, predicted = outputs.max(1)
             train_total += targets.size(0)
-            train_correct += predicted.eq(targets).sum().item()
+            train_correct += predicted.eq(targets).sum()
 
-            batch_grads = tuple(p.grad.detach().clone() for p in model.parameters())
-            deviations = get_batch_deviations(model, batch_grads, inputs, targets, chunk_size=16)
-            G_scores[indices.cpu().numpy()] += deviations.cpu().numpy()
+            deviations = get_batch_deviations(model, inputs, targets, vmap_chunk_size, args.compile)
+            G_scores.scatter_add_(0, indices, deviations)
 
             optimizer.step()
             scheduler.step()
 
         epoch_time = time.time() - start_time
         current_lr = scheduler.get_last_lr()[0]
-        train_loss = train_loss_sum / train_total
-        train_acc = 100. * train_correct / train_total
+        train_loss = train_loss_sum.item() / train_total
+        train_acc = 100. * train_correct.item() / train_total
 
         test_loss, test_acc = evaluate(model, test_loader, device)
         epoch_num = epoch + 1
@@ -417,19 +471,19 @@ def train_with_exact_gradient_deviation(args):
             'G_scores': G_scores,
             'best_test_acc': best_test_acc
         }
-        torch.save(checkpoint, os.path.join(SCRATCH_DIR, f'checkpoint_{run_name}.pth'))
+        torch.save(checkpoint, os.path.join(args.out, f'checkpoint_{run_name}.pth'))
 
         if test_acc > best_test_acc:
             best_test_acc = test_acc
-            torch.save(checkpoint, os.path.join(SCRATCH_DIR, f'checkpoint_best_{run_name}.pth'))
+            torch.save(checkpoint, os.path.join(args.out, f'checkpoint_best_{run_name}.pth'))
 
         # --- SAVE SCORES PROGRESSION TRAJECTORY ---
         if args.save_epoch_scores and (epoch_num <= 10 or epoch_num % 10 == 0):
             history_file_name = f"epoch_scores_{run_name}_epoch{epoch_num}.npy"
-            np.save(os.path.join(SCRATCH_DIR, history_file_name), G_scores)
+            np.save(os.path.join(args.out, history_file_name), G_scores.cpu().numpy())
             print(f" Saved score snapshot to {history_file_name}")
 
-    np.save(os.path.join(SCRATCH_DIR, f'batch_gradient_deviation_scores_{run_name}.npy'), G_scores)
+    np.save(os.path.join(args.out, f'batch_gradient_deviation_scores_{run_name}.npy'), G_scores.cpu().numpy())
     print(f"Training complete! Final G_scores saved for seed {args.seed}.")
 
 if __name__ == '__main__':
@@ -441,8 +495,18 @@ if __name__ == '__main__':
     parser.add_argument('--scores_path', type=str, default=None, help='Path to .npy file containing scores.')
     parser.add_argument('--k', type=int, default=0, help='Number of lowest scoring points to exclude.')
     parser.add_argument('--method_name', type=str, default='baseline', help='Name of the attribution method.')
-    
-    # New Argument requested
+    parser.add_argument('--out', type=str,
+                        default=os.path.join(os.environ["SCRATCH"], "attribution_training_runs") if "SCRATCH" in os.environ else "./runs",
+                        help='Output directory for saved files.')
+    parser.add_argument('--data', type=str,
+                        # May be copied from the cluster using:
+                        # tar -xzf /network/datasets/cifar100/cifar-100-python.tar.gz -C ./data
+                        default=os.environ.get('SLURM_TMPDIR', './data'),
+                        help='Datasets directory.')
+    default_compile_mode = "reduce-overhead"
+    parser.add_argument('--compile', nargs='?', const=default_compile_mode, default=None,
+                        choices=['default', 'reduce-overhead', 'max-autotune', 'max-autotune-no-cudagraphs'],
+                        help=f'Compile vmap with torch.compile. Use without a value for mode="{default_compile_mode}", or pass a mode explicitly (e.g. --compile default).')
     parser.add_argument('--save_epoch_scores', action='store_true', help='Save score files sequentially over epochs.')
     args = parser.parse_args()
 
